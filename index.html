@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Velocímetro con grabación</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #000; color: #fff;
+    font: 16px system-ui, -apple-system, sans-serif;
+    min-height: 100dvh; display: flex; flex-direction: column;
+    align-items: center; gap: 12px; padding: 12px;
+  }
+  video#src { display: none; }
+  canvas { width: 100%; max-width: 720px; height: auto; background: #111; border-radius: 8px; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  button { font: inherit; padding: 12px 18px; border-radius: 8px; border: 0; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.stop { background: #dc2626; }
+  #status { font-size: 14px; opacity: .8; text-align: center; min-height: 1.2em; }
+  #result { width: 100%; max-width: 720px; display: none; }
+  #result video { width: 100%; border-radius: 8px; }
+  a.dl { display: inline-block; margin-top: 8px; color: #60a5fa; }
+</style>
+</head>
+<body>
+<video id="src" autoplay muted playsinline></video>
+<canvas id="cv" width="1280" height="720"></canvas>
+<div class="bar">
+  <button id="start">Activar cámara y GPS</button>
+  <button id="rec" disabled>Grabar</button>
+  <button id="stop" class="stop" disabled>Detener</button>
+</div>
+<div id="status">Presiona “Activar cámara y GPS” y acepta los permisos.</div>
+<div id="result"></div>
+
+<script>
+const video = document.getElementById('src');
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+const startBtn = $('start'), recBtn = $('rec'), stopBtn = $('stop');
+const statusEl = $('status'), resultEl = $('result');
+
+let media = null;
+let wakeLock = null;
+let track = [];          // {lat, lon, t}
+let speedHist = [];     // últimas lecturas en km/h
+let speedKmh = null;    // promedio móvil
+let lastPos = null;
+let recorder = null, chunks = [], recording = false, recStart = 0;
+
+function haversine(a, b) {
+  const R = 6371000, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function onPosition(p) {
+  const c = p.coords;
+  if (c.accuracy > 50) return;                 // descarta lecturas poco precisas
+  const pt = { lat: c.latitude, lon: c.longitude, t: p.timestamp };
+  let ms = c.speed;                            // m/s, puede ser null
+  if ((ms == null || Number.isNaN(ms)) && lastPos && pt.t > lastPos.t) {
+    ms = haversine(lastPos, pt) / ((pt.t - lastPos.t) / 1000);
+  }
+  lastPos = pt;
+  track.push(pt);
+  if (ms != null && !Number.isNaN(ms)) {
+    speedHist.push(ms * 3.6);
+    if (speedHist.length > 3) speedHist.shift();
+    speedKmh = speedHist.reduce((a, b) => a + b, 0) / speedHist.length;
+  }
+}
+
+function fmt(ms) {
+  const t = Math.floor(ms / 100);
+  const d = t % 10, sec = Math.floor(t / 10) % 60, min = Math.floor(t / 600);
+  return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${d}`;
+}
+
+function drawMap(x, y, w, h, s) {
+  ctx.fillStyle = 'rgba(0,0,0,.6)';
+  ctx.fillRect(x, y, w, h);
+  if (track.length < 2) {
+    ctx.fillStyle = '#fff';
+    ctx.font = `${14 * s}px system-ui,sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Esperando GPS…', x + w / 2, y + h / 2);
+    return;
+  }
+  const cosLat = Math.cos(track[0].lat * Math.PI / 180);
+  const pts = track.map(p => ({ x: p.lon * cosLat, y: -p.lat }));   // norte arriba
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  const spanX = Math.max(maxX - minX, 0.0005), spanY = Math.max(maxY - minY, 0.0005);
+  const pad = 16 * s, aw = w - 2 * pad, ah = h - 2 * pad;
+  const k = Math.min(aw / spanX, ah / spanY);
+  const ox = x + pad + (aw - spanX * k) / 2 - minX * k;
+  const oy = y + pad + (ah - spanY * k) / 2 - minY * k;
+  const P = p => [ox + p.x * k, oy + p.y * k];
+
+  ctx.strokeStyle = 'rgba(255,255,255,.55)';
+  ctx.lineWidth = 3 * s; ctx.lineJoin = 'round';
+  ctx.beginPath();
+  pts.forEach((p, i) => { const [X, Y] = P(p); i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); });
+  ctx.stroke();
+
+  const [cx, cy] = P(pts[pts.length - 1]);
+  ctx.fillStyle = '#22d3ee';
+  ctx.beginPath(); ctx.arc(cx, cy, 7 * s, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawSpeedo(cx, cy, r, s) {
+  const start = Math.PI * 0.75, end = Math.PI * 2.25, max = 200;
+  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.beginPath(); ctx.arc(cx, cy, r * 1.25, 0, Math.PI * 2); ctx.fill();
+
+  ctx.lineCap = 'round'; ctx.lineWidth = r * 0.14;
+  ctx.strokeStyle = 'rgba(255,255,255,.25)';
+  ctx.beginPath(); ctx.arc(cx, cy, r, start, end); ctx.stroke();
+
+  const frac = Math.min((speedKmh || 0) / max, 1);
+  ctx.strokeStyle = '#22d3ee';
+  ctx.beginPath(); ctx.arc(cx, cy, r, start, start + (end - start) * frac); ctx.stroke();
+
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${r * 0.6}px system-ui,sans-serif`;
+  ctx.fillText(speedKmh == null ? '--' : String(Math.round(speedKmh)), cx, cy - r * 0.05);
+  ctx.font = `${r * 0.22}px system-ui,sans-serif`;
+  ctx.fillText('km/h', cx, cy + r * 0.45);
+}
+
+function frame() {
+  if (!media) return;
+  const W = cv.width, H = cv.height, s = Math.min(W, H) / 720;
+  if (video.readyState >= 2) ctx.drawImage(video, 0, 0, W, H);
+
+  // Cronómetro
+  const el = recording ? Date.now() - recStart : 0;
+  ctx.fillStyle = 'rgba(0,0,0,.6)';
+  ctx.fillRect(20 * s, 20 * s, 250 * s, 64 * s);
+  if (recording) {
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath(); ctx.arc(44 * s, 52 * s, 9 * s, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.font = `bold ${36 * s}px ui-monospace,Menlo,monospace`;
+  ctx.fillText(fmt(el), (recording ? 64 : 36) * s, 52 * s);
+
+  drawMap(W - 320 * s, 20 * s, 300 * s, 220 * s, s);
+  drawSpeedo(W - 160 * s, H - 160 * s, 110 * s, s);
+
+  requestAnimationFrame(frame);
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  try {
+    media = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: true
+    });
+  } catch (e) {
+    statusEl.textContent = 'No se pudo acceder a la cámara o al micrófono: ' + e.message;
+    startBtn.disabled = false;
+    return;
+  }
+  video.srcObject = media;
+  await video.play().catch(() => {});
+  cv.width = video.videoWidth || 1280;
+  cv.height = video.videoHeight || 720;
+
+  if ('wakeLock' in navigator) {
+    navigator.wakeLock.request('screen').then(w => wakeLock = w).catch(() => {});
+  }
+  navigator.geolocation.watchPosition(onPosition,
+    err => { statusEl.textContent = 'GPS: ' + err.message; },
+    { enableHighAccuracy: true, maximumAge: 0 });
+
+  requestAnimationFrame(frame);
+  recBtn.disabled = false;
+  statusEl.textContent = 'Listo. Presiona Grabar.';
+};
+
+function pickType() {
+  const types = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+  return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+}
+
+recBtn.onclick = () => {
+  const stream = cv.captureStream(30);
+  media.getAudioTracks().forEach(t => stream.addTrack(t));
+  const type = pickType();
+  recorder = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    const blob = new Blob(chunks, { type: recorder.mimeType || type || 'video/webm' });
+    const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+    const url = URL.createObjectURL(blob);
+    resultEl.innerHTML = '';
+    const v = document.createElement('video');
+    v.controls = true; v.playsInline = true; v.src = url;
+    const a = document.createElement('a');
+    a.href = url; a.download = `velocidad-${Date.now()}.${ext}`;
+    a.textContent = 'Descargar video'; a.className = 'dl';
+    resultEl.append(v, a);
+    resultEl.style.display = 'block';
+    statusEl.textContent = 'Grabación lista.';
+  };
+  recorder.start(1000);
+  recStart = Date.now();
+  recording = true;
+  recBtn.disabled = true;
+  stopBtn.disabled = false;
+  statusEl.textContent = 'Grabando…';
+};
+
+stopBtn.onclick = () => {
+  recording = false;
+  recorder.stop();
+  stopBtn.disabled = true;
+  recBtn.disabled = false;
+};
+</script>
+</body>
+</html>
