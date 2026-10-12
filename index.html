@@ -60,21 +60,27 @@ function haversine(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
+// La velocidad se calcula con la distancia recorrida en una ventana de tiempo,
+// no con coords.speed, que en muchos celulares llega tarde o en cero al caminar.
+const WINDOW_MS = 6000;   // ventana de 6 s: suaviza el ruido del GPS
+
 function onPosition(p) {
   const c = p.coords;
-  if (c.accuracy > 50) return;                 // descarta lecturas poco precisas
+  if (c.accuracy > 30) return;                 // descarta lecturas poco precisas
   const pt = { lat: c.latitude, lon: c.longitude, t: p.timestamp };
-  let ms = c.speed;                            // m/s, puede ser null
-  if ((ms == null || Number.isNaN(ms)) && lastPos && pt.t > lastPos.t) {
-    ms = haversine(lastPos, pt) / ((pt.t - lastPos.t) / 1000);
-  }
   lastPos = pt;
   track.push(pt);
-  if (ms != null && !Number.isNaN(ms)) {
-    speedHist.push(ms * 3.6);
-    if (speedHist.length > 3) speedHist.shift();
-    speedKmh = speedHist.reduce((a, b) => a + b, 0) / speedHist.length;
-  }
+
+  // punto más antiguo dentro de la ventana
+  const past = track.filter(q => pt.t - q.t <= WINDOW_MS);
+  const first = past[0];
+  const dt = (pt.t - first.t) / 1000;
+  if (past.length < 2 || dt < 2) return;       // esperar al menos 2 s de datos
+
+  const dist = haversine(first, pt);           // metros en la ventana
+  speedKmh = (dist / dt) * 3.6;
+  speedHist.push(speedKmh);
+  if (speedHist.length > 2) speedHist.shift();
 }
 
 function fmt(ms) {
